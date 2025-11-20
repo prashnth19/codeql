@@ -1,0 +1,6 @@
+# One repo name per line (no org prefix).
+# Lines starting with # are comments.
+
+legacy-service
+playground-repo
+experimental-codeql-test
