@@ -1,0 +1,98 @@
+name: CodeQL Health Scan
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Every day at 07:00 UTC (adjust as you like)
+    - cron: "0 7 * * *"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    env:
+      ORG: your-org-name                    # <-- set your org name here
+      GITHUB_TOKEN: ${{ secrets.GH_PAT }}   # Personal access token with read:org, repo
+      EXCLUDE_FILE: config/exclude_repos.txt
+      OUTPUT_DIR: output
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}          # optional
+      AWS_SNS_TOPIC_ARN: ${{ secrets.AWS_SNS_TOPIC_ARN }}          # optional
+      AWS_REGION: ${{ secrets.AWS_REGION }}                         # optional
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}          # optional
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}  # optional
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Ensure gh and jq are installed
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "gh CLI not found, installing..."
+            type -p curl >/dev/null || (sudo apt update && sudo apt install -y curl)
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install -y gh
+          fi
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq not found, installing..."
+            sudo apt update
+            sudo apt install -y jq
+          fi
+
+      - name: Run CodeQL health scan
+        id: scan
+        run: |
+          ./scripts/scan_codeql_health.sh
+
+      - name: Compute failing repo count from JSON
+        id: stats
+        run: |
+          FAILING_COUNT=$(jq '[.[] | select(.status=="FAILING")] | length' output/codeql_report.json)
+          echo "failing_count=$FAILING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Failing repos: $FAILING_COUNT"
+
+      - name: Upload reports as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-health-report
+          path: |
+            output/codeql_report.csv
+            output/codeql_report.json
+            output/codeql_summary.txt
+          if-no-files-found: error
+
+      # ---------- Optional: Notify Microsoft Teams ----------
+      - name: Notify Microsoft Teams (if failing repos)
+        if: ${{ env.TEAMS_WEBHOOK_URL != '' && steps.stats.outputs.failing_count != '0' }}
+        run: |
+          SUMMARY=$(cat output/codeql_summary.txt)
+          # Escape newlines for JSON
+          SUMMARY_ESCAPED=$(printf '%s\n' "$SUMMARY" | jq -Rs .)
+
+          # Teams expects a JSON object with 'text'
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "CodeQL health report for org: $ORG\n\n$(printf '%s' "$SUMMARY" | sed 's/"/\\"/g')"
+          }
+          EOF
+          )
+
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$TEAMS_WEBHOOK_URL"
+
+      # ---------- Optional: Notify via AWS SNS ----------
+      - name: Publish summary to AWS SNS (if configured)
+        if: ${{ env.AWS_SNS_TOPIC_ARN != '' && steps.stats.outputs.failing_count != '0' }}
+        run: |
+          SUMMARY=$(cat output/codeql_summary.txt)
+          aws sns publish \
+            --region "$AWS_REGION" \
+            --topic-arn "$AWS_SNS_TOPIC_ARN" \
+            --subject "CodeQL Health Report - org: $ORG" \
+            --message "$SUMMARY"
